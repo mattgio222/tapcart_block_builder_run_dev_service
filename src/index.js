@@ -341,6 +341,10 @@ const createSessionProxy = (sessionId, session) => {
       return path;
     },
     ws: true,
+    onProxyRes: (proxyRes, req, res) => {
+      // Add CSP header to upgrade HTTP to HTTPS (fixes mixed content issues)
+      proxyRes.headers['content-security-policy'] = 'upgrade-insecure-requests';
+    },
     onError: (err, req, res) => {
       console.error(`[PROXY] Error for session ${sessionId}:`, err.message);
       if (res.writeHead) {
