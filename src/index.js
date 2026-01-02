@@ -68,25 +68,81 @@ const createFlyApp = async (appName) => {
   });
 };
 
-// Allocate IP addresses for an app
+// Allocate IP addresses for an app (uses GraphQL API)
 const allocateIPs = async (appName) => {
   console.log(`[FLY] Allocating IPs for app: ${appName}`);
 
+  const graphqlUrl = 'https://api.fly.io/graphql';
+
   // Allocate shared IPv4
-  await flyFetch(`/apps/${appName}/ips`, {
+  const ipv4Response = await fetch(graphqlUrl, {
     method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${FLY_API_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
     body: JSON.stringify({
-      type: 'shared_v4',
+      query: `
+        mutation($input: AllocateIPAddressInput!) {
+          allocateIpAddress(input: $input) {
+            ipAddress {
+              id
+              address
+              type
+            }
+          }
+        }
+      `,
+      variables: {
+        input: {
+          appId: appName,
+          type: 'shared_v4',
+        },
+      },
     }),
   });
 
+  const ipv4Result = await ipv4Response.json();
+  if (ipv4Result.errors) {
+    console.error(`[FLY] IPv4 allocation error:`, ipv4Result.errors);
+  } else {
+    console.log(`[FLY] IPv4 allocated:`, ipv4Result.data?.allocateIpAddress?.ipAddress?.address);
+  }
+
   // Allocate IPv6
-  await flyFetch(`/apps/${appName}/ips`, {
+  const ipv6Response = await fetch(graphqlUrl, {
     method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${FLY_API_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
     body: JSON.stringify({
-      type: 'v6',
+      query: `
+        mutation($input: AllocateIPAddressInput!) {
+          allocateIpAddress(input: $input) {
+            ipAddress {
+              id
+              address
+              type
+            }
+          }
+        }
+      `,
+      variables: {
+        input: {
+          appId: appName,
+          type: 'v6',
+        },
+      },
     }),
   });
+
+  const ipv6Result = await ipv6Response.json();
+  if (ipv6Result.errors) {
+    console.error(`[FLY] IPv6 allocation error:`, ipv6Result.errors);
+  } else {
+    console.log(`[FLY] IPv6 allocated:`, ipv6Result.data?.allocateIpAddress?.ipAddress?.address);
+  }
 
   console.log(`[FLY] IPs allocated for app: ${appName}`);
 };
