@@ -1,11 +1,14 @@
 require('dotenv').config();
 const express = require('express');
-const { spawn } = require('child_process');
+const { spawn, exec } = require('child_process');
+const { promisify } = require('util');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs').promises;
 const net = require('net');
+
+const execPromise = promisify(exec);
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -140,19 +143,9 @@ app.post('/start-dev', authenticateApiKey, async (req, res) => {
   try {
     // Create temp directory for this session
     const sessionDir = `/tmp/sessions/${sessionId}`;
-    const blockDir = `${sessionDir}/blocks/${appStudioBlockName}`;
-    await fs.mkdir(blockDir, { recursive: true });
+    await fs.mkdir(sessionDir, { recursive: true });
 
-    // Write code.jsx
-    await fs.writeFile(`${blockDir}/code.jsx`, codeJsx);
-
-    // Write manifest.json if provided
-    if (manifestJson) {
-      const manifest = typeof manifestJson === 'string' ? manifestJson : JSON.stringify(manifestJson, null, 2);
-      await fs.writeFile(`${blockDir}/manifest.json`, manifest);
-    }
-
-    // Write tapcart.config.json
+    // Write tapcart.config.json first (required before block create)
     await fs.writeFile(`${sessionDir}/tapcart.config.json`, JSON.stringify({
       appId,
       dependencies: {}
@@ -164,6 +157,25 @@ app.post('/start-dev', authenticateApiKey, async (req, res) => {
       version: "1.0.0",
       private: true
     }, null, 2));
+
+    // Create the block using tapcart CLI (this creates config.json and updates tapcart.config.json)
+    console.log(`[${sessionId}] Creating block "${appStudioBlockName}"...`);
+    await execPromise(`tapcart block create "${appStudioBlockName}"`, {
+      cwd: sessionDir,
+      timeout: 60000,
+      env: { ...process.env, TAPCART_API_KEY: tapcartCliApiKey }
+    });
+    console.log(`[${sessionId}] Block created successfully`);
+
+    // Now overwrite code.jsx with the provided code
+    const blockDir = `${sessionDir}/blocks/${appStudioBlockName}`;
+    await fs.writeFile(`${blockDir}/code.jsx`, codeJsx);
+
+    // Write manifest.json if provided
+    if (manifestJson) {
+      const manifest = typeof manifestJson === 'string' ? manifestJson : JSON.stringify(manifestJson, null, 2);
+      await fs.writeFile(`${blockDir}/manifest.json`, manifest);
+    }
 
     // Spawn tapcart dev server as child process
     const childProcess = spawn('tapcart', ['block', 'dev', '-b', appStudioBlockName, '-p', port.toString()], {
