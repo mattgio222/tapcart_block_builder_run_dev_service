@@ -1,12 +1,10 @@
-# Dockerfile for the orchestrator service
+# Dockerfile for the run-dev service
 FROM node:20-slim
 
-# Install Docker CLI (for managing dev containers)
-RUN apt-get update && apt-get install -y \
-    docker.io \
-    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
+
+# Install tapcart CLI globally
+RUN npm install -g @tapcart/tapcart-cli
 
 # Copy package files
 COPY package*.json ./

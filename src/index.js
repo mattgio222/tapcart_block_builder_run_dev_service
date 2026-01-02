@@ -1,19 +1,20 @@
 require('dotenv').config();
 const express = require('express');
-const Docker = require('dockerode');
+const { spawn } = require('child_process');
+const { createProxyMiddleware } = require('http-proxy-middleware');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs').promises;
+const net = require('net');
 
 const app = express();
-const docker = new Docker();
 const PORT = process.env.PORT || 3002;
 const BASE_URL = process.env.BASE_URL || 'http://localhost';
 
-// Session storage: sessionId -> { containerId, port, blockName, createdAt }
+// Session storage: sessionId -> { process, port, blockName, createdAt }
 const sessions = new Map();
 
-// Port range for dev containers
+// Port range for dev servers (internal ports, not exposed externally)
 const PORT_START = 6001;
 const PORT_END = 6020;
 const usedPorts = new Set();
@@ -33,11 +34,22 @@ app.get('/health', (req, res) => {
 });
 
 // Get available port
-const getAvailablePort = () => {
+const getAvailablePort = async () => {
   for (let port = PORT_START; port <= PORT_END; port++) {
     if (!usedPorts.has(port)) {
-      usedPorts.add(port);
-      return port;
+      // Check if port is actually available
+      const available = await new Promise((resolve) => {
+        const server = net.createServer();
+        server.listen(port, '0.0.0.0', () => {
+          server.close(() => resolve(true));
+        });
+        server.on('error', () => resolve(false));
+      });
+
+      if (available) {
+        usedPorts.add(port);
+        return port;
+      }
     }
   }
   return null;
@@ -56,11 +68,22 @@ const cleanupSession = async (sessionId) => {
   console.log(`[CLEANUP] Cleaning up session ${sessionId}`);
 
   try {
-    const container = docker.getContainer(session.containerId);
-    await container.stop({ t: 5 }).catch(() => {});
-    await container.remove({ force: true }).catch(() => {});
+    // Kill the child process
+    if (session.process && !session.process.killed) {
+      session.process.kill('SIGTERM');
+      // Force kill after 5 seconds if still running
+      setTimeout(() => {
+        if (session.process && !session.process.killed) {
+          session.process.kill('SIGKILL');
+        }
+      }, 5000);
+    }
+
+    // Clean up session directory
+    const sessionDir = `/tmp/sessions/${sessionId}`;
+    await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
   } catch (err) {
-    console.error(`[CLEANUP] Error removing container:`, err.message);
+    console.error(`[CLEANUP] Error:`, err.message);
   }
 
   releasePort(session.port);
@@ -106,7 +129,7 @@ app.post('/start-dev', authenticateApiKey, async (req, res) => {
   }
 
   const sessionId = uuidv4().slice(0, 8);
-  const port = getAvailablePort();
+  const port = await getAvailablePort();
 
   if (!port) {
     return res.status(503).json({ error: 'No available ports' });
@@ -142,50 +165,109 @@ app.post('/start-dev', authenticateApiKey, async (req, res) => {
       private: true
     }, null, 2));
 
-    // Create and start Docker container
-    const container = await docker.createContainer({
-      Image: 'node:20-slim',
-      Cmd: [
-        'sh', '-c',
-        `npm install -g @tapcart/tapcart-cli && tapcart block dev -b "${appStudioBlockName}" -p 5000`
-      ],
-      Env: [
-        `TAPCART_API_KEY=${tapcartCliApiKey}`,
-        `NODE_ENV=development`
-      ],
-      ExposedPorts: { '5000/tcp': {} },
-      HostConfig: {
-        PortBindings: { '5000/tcp': [{ HostPort: port.toString() }] },
-        Binds: [`${sessionDir}:/app`],
-        AutoRemove: false
+    // Spawn tapcart dev server as child process
+    const childProcess = spawn('tapcart', ['block', 'dev', '-b', appStudioBlockName, '-p', port.toString()], {
+      cwd: sessionDir,
+      env: {
+        ...process.env,
+        TAPCART_API_KEY: tapcartCliApiKey,
+        NODE_ENV: 'development'
       },
-      WorkingDir: '/app',
-      name: `tapcart-dev-${sessionId}`
+      stdio: ['ignore', 'pipe', 'pipe']
     });
 
-    await container.start();
+    let serverStarted = false;
+    let startError = null;
 
-    // Store session
+    // Capture output for debugging
+    childProcess.stdout.on('data', (data) => {
+      const output = data.toString();
+      console.log(`[${sessionId}] stdout: ${output}`);
+      // Check if server started successfully
+      if (output.includes('Dev server running') || output.includes('listening') || output.includes('Started')) {
+        serverStarted = true;
+      }
+    });
+
+    childProcess.stderr.on('data', (data) => {
+      const output = data.toString();
+      console.error(`[${sessionId}] stderr: ${output}`);
+      if (output.includes('Error') || output.includes('error')) {
+        startError = output;
+      }
+    });
+
+    childProcess.on('error', (err) => {
+      console.error(`[${sessionId}] Process error:`, err);
+      startError = err.message;
+    });
+
+    childProcess.on('exit', (code, signal) => {
+      console.log(`[${sessionId}] Process exited with code ${code}, signal ${signal}`);
+      // Clean up if process exits unexpectedly
+      if (sessions.has(sessionId)) {
+        cleanupSession(sessionId);
+      }
+    });
+
+    // Store session immediately
     sessions.set(sessionId, {
-      containerId: container.id,
+      process: childProcess,
       port,
       blockName: appStudioBlockName,
       configurationId,
       createdAt: Date.now()
     });
 
-    // Wait for server to start
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // Wait for server to start (poll for a few seconds)
+    const startTime = Date.now();
+    const timeout = 15000; // 15 seconds
 
-    // Check if container is still running
-    const containerInfo = await container.inspect();
-    if (!containerInfo.State.Running) {
-      await cleanupSession(sessionId);
-      return res.status(500).json({ error: 'Dev server failed to start' });
+    while (!serverStarted && !startError && Date.now() - startTime < timeout) {
+      // Check if process is still running
+      if (childProcess.killed || childProcess.exitCode !== null) {
+        startError = 'Process exited unexpectedly';
+        break;
+      }
+
+      // Try to connect to the port
+      const isReady = await new Promise((resolve) => {
+        const socket = new net.Socket();
+        socket.setTimeout(1000);
+        socket.on('connect', () => {
+          socket.destroy();
+          resolve(true);
+        });
+        socket.on('error', () => {
+          socket.destroy();
+          resolve(false);
+        });
+        socket.on('timeout', () => {
+          socket.destroy();
+          resolve(false);
+        });
+        socket.connect(port, '127.0.0.1');
+      });
+
+      if (isReady) {
+        serverStarted = true;
+        break;
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
 
-    const url = `${BASE_URL}:${port}`;
-    console.log(`[START] Session ${sessionId} started at ${url}`);
+    if (!serverStarted) {
+      await cleanupSession(sessionId);
+      return res.status(500).json({
+        error: 'Dev server failed to start',
+        details: startError || 'Timeout waiting for server'
+      });
+    }
+
+    // URL for accessing this session via proxy
+    const url = `${BASE_URL}/dev/${sessionId}`;
+    console.log(`[START] Session ${sessionId} started at ${url} (internal port ${port})`);
 
     res.json({
       success: true,
@@ -198,6 +280,7 @@ app.post('/start-dev', authenticateApiKey, async (req, res) => {
   } catch (error) {
     console.error(`[START] Error:`, error);
     releasePort(port);
+    sessions.delete(sessionId);
     res.status(500).json({ error: 'Failed to start dev server', details: error.message });
   }
 });
@@ -223,10 +306,36 @@ app.get('/sessions', authenticateApiKey, (req, res) => {
       port: session.port,
       blockName: session.blockName,
       createdAt: session.createdAt,
-      url: `${BASE_URL}:${session.port}`
+      url: `${BASE_URL}/dev/${id}`
     });
   }
   res.json({ sessions: sessionList });
+});
+
+// Proxy requests to dev sessions: /dev/:sessionId/*
+app.use('/dev/:sessionId', (req, res, next) => {
+  const { sessionId } = req.params;
+  const session = sessions.get(sessionId);
+
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  // Create proxy middleware for this request
+  const proxy = createProxyMiddleware({
+    target: `http://127.0.0.1:${session.port}`,
+    changeOrigin: true,
+    pathRewrite: {
+      [`^/dev/${sessionId}`]: ''
+    },
+    ws: true,
+    onError: (err, req, res) => {
+      console.error(`[PROXY] Error for session ${sessionId}:`, err.message);
+      res.status(502).json({ error: 'Dev server unavailable' });
+    }
+  });
+
+  return proxy(req, res, next);
 });
 
 // Start server
@@ -242,6 +351,14 @@ app.listen(PORT, () => {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, cleaning up...');
+  for (const sessionId of sessions.keys()) {
+    await cleanupSession(sessionId);
+  }
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, cleaning up...');
   for (const sessionId of sessions.keys()) {
     await cleanupSession(sessionId);
   }

@@ -1,32 +1,35 @@
 # Block Builder Run Dev Service
 
-A containerized service that runs isolated Tapcart dev servers for each session.
+A service that runs Tapcart dev servers for each session, with built-in proxying.
 
 ## Architecture
 
-Unlike the proxy-based approach, this service:
-1. Spins up a separate Docker container for each dev session
-2. Each container runs the Tapcart CLI dev server directly
-3. Users connect directly to the container's exposed port
-4. No proxy complexity - the dev server runs exactly as it would locally
+This service:
+1. Spawns the Tapcart CLI dev server as a child process for each session
+2. Proxies requests to the appropriate dev server based on session ID
+3. Automatically cleans up sessions after timeout (30 minutes)
 
 ## Requirements
 
-- Docker
 - Node.js 20+
-- Access to Docker socket (for container management)
+- @tapcart/tapcart-cli (installed globally in the Docker image)
 
 ## Local Development
 
 1. Copy `.env.example` to `.env` and configure
-2. Build the dev container image:
+2. Install dependencies:
    ```bash
-   docker build -t tapcart-dev -f Dockerfile.dev .
+   npm install
    ```
-3. Run with docker-compose:
+3. Run the service:
    ```bash
-   docker-compose up
+   npm run dev
    ```
+
+Or with Docker:
+```bash
+docker-compose up
+```
 
 ## API Endpoints
 
@@ -55,7 +58,7 @@ Start a new dev session.
   "success": true,
   "sessionId": "abc123",
   "port": 6001,
-  "url": "http://localhost:6001",
+  "url": "https://your-service.fly.dev/dev/abc123",
   "message": "Dev server started"
 }
 ```
@@ -64,24 +67,24 @@ Start a new dev session.
 Stop a dev session.
 
 ### GET /sessions
-List all active sessions.
+List all active sessions (requires API key).
 
 ### GET /health
 Health check endpoint.
 
-## Deployment Options
+### GET /dev/:sessionId/*
+Proxy endpoint - forwards requests to the session's dev server.
 
-### Option 1: Fly.io (Recommended)
-Fly.io Machines are designed for this use case - ephemeral VMs that can be spun up on demand.
+## Deployment
 
-### Option 2: DigitalOcean/Linode VPS
-A VPS with Docker installed gives full control over container management.
-
-### Option 3: Railway with Docker
-Railway supports Docker, but may have limitations with Docker-in-Docker.
+### Fly.io (Recommended)
+Deploy with:
+```bash
+fly deploy
+```
 
 ## Environment Variables
 
 - `PORT`: Service port (default: 3002)
-- `BASE_URL`: Base URL for generated session URLs
+- `BASE_URL`: Base URL for generated session URLs (e.g., https://your-app.fly.dev)
 - `SERVICE_API_KEY`: API key for authentication

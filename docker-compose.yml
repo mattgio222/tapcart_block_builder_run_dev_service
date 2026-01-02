@@ -1,16 +1,14 @@
 version: '3.8'
 
 services:
-  orchestrator:
+  run-dev-service:
     build: .
     ports:
       - "3002:3002"
-      - "6001-6020:6001-6020"  # Ports for dev containers
     environment:
       - PORT=3002
-      - BASE_URL=http://localhost
+      - BASE_URL=http://localhost:3002
       - SERVICE_API_KEY=${SERVICE_API_KEY}
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker
       - /tmp/sessions:/tmp/sessions
     restart: unless-stopped
