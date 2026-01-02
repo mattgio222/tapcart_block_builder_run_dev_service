@@ -68,6 +68,29 @@ const createFlyApp = async (appName) => {
   });
 };
 
+// Allocate IP addresses for an app
+const allocateIPs = async (appName) => {
+  console.log(`[FLY] Allocating IPs for app: ${appName}`);
+
+  // Allocate shared IPv4
+  await flyFetch(`/apps/${appName}/ips`, {
+    method: 'POST',
+    body: JSON.stringify({
+      type: 'shared_v4',
+    }),
+  });
+
+  // Allocate IPv6
+  await flyFetch(`/apps/${appName}/ips`, {
+    method: 'POST',
+    body: JSON.stringify({
+      type: 'v6',
+    }),
+  });
+
+  console.log(`[FLY] IPs allocated for app: ${appName}`);
+};
+
 // Delete a Fly app
 const deleteFlyApp = async (appName) => {
   console.log(`[FLY] Deleting app: ${appName}`);
@@ -182,13 +205,16 @@ app.post('/start-dev', authenticateApiKey, async (req, res) => {
     await createFlyApp(appName);
     console.log(`[START] App ${appName} created`);
 
-    // Step 2: Base64 encode the code files
+    // Step 2: Allocate IP addresses for the app
+    await allocateIPs(appName);
+
+    // Step 3: Base64 encode the code files
     const codeJsxB64 = Buffer.from(codeJsx).toString('base64');
     const manifestJsonB64 = manifestJson
       ? Buffer.from(typeof manifestJson === 'string' ? manifestJson : JSON.stringify(manifestJson)).toString('base64')
       : '';
 
-    // Step 3: Create the machine with the session image
+    // Step 4: Create the machine with the session image
     const machineConfig = {
       name: `dev-${sessionId}`,
       region: FLY_REGION,
@@ -229,11 +255,11 @@ app.post('/start-dev', authenticateApiKey, async (req, res) => {
     const machine = await createMachine(appName, machineConfig);
     console.log(`[START] Machine ${machine.id} created`);
 
-    // Step 4: Wait for machine to be ready
+    // Step 5: Wait for machine to be ready
     await waitForMachine(appName, machine.id);
     console.log(`[START] Machine ${machine.id} is ready`);
 
-    // Step 5: Store session info
+    // Step 6: Store session info
     const url = `https://${appName}.fly.dev`;
     sessions.set(sessionId, {
       appName,
