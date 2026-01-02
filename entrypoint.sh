@@ -1,0 +1,45 @@
+#!/bin/bash
+set -e
+
+echo "Starting Tapcart dev session..."
+echo "App ID: $APP_ID"
+echo "Block Name: $BLOCK_NAME"
+
+# Create project structure
+mkdir -p /app/blocks/"$BLOCK_NAME"
+
+# Write tapcart.config.json
+echo "{\"appId\": \"$APP_ID\", \"dependencies\": {}}" > /app/tapcart.config.json
+
+# Write package.json
+echo '{"name": "tapcart-dev", "version": "1.0.0", "private": true}' > /app/package.json
+
+# Decode and write code.jsx from base64
+if [ -n "$CODE_JSX_B64" ]; then
+    echo "$CODE_JSX_B64" | base64 -d > /app/blocks/"$BLOCK_NAME"/code.jsx
+    echo "Wrote code.jsx"
+fi
+
+# Decode and write manifest.json from base64 (optional)
+if [ -n "$MANIFEST_JSON_B64" ]; then
+    echo "$MANIFEST_JSON_B64" | base64 -d > /app/blocks/"$BLOCK_NAME"/manifest.json
+    echo "Wrote manifest.json"
+fi
+
+# Create the block using tapcart CLI (creates config.json)
+echo "Creating block structure..."
+cd /app
+tapcart block create "$BLOCK_NAME" 2>/dev/null || true
+
+# Re-write code.jsx after block create (it may have been overwritten with template)
+if [ -n "$CODE_JSX_B64" ]; then
+    echo "$CODE_JSX_B64" | base64 -d > /app/blocks/"$BLOCK_NAME"/code.jsx
+fi
+
+# Re-write manifest.json if provided
+if [ -n "$MANIFEST_JSON_B64" ]; then
+    echo "$MANIFEST_JSON_B64" | base64 -d > /app/blocks/"$BLOCK_NAME"/manifest.json
+fi
+
+echo "Starting dev server on port 5000..."
+exec tapcart block dev -b "$BLOCK_NAME" -p 5000
