@@ -6,8 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "build-session-image": "docker build -t tapcart-dev-session -f Dockerfile.session .",
-    "push-session-image": "fly auth docker && docker tag tapcart-dev-session registry.fly.io/tapcart-dev-session:latest && docker push registry.fly.io/tapcart-dev-session:latest"
+    "deploy-session-image": "fly deploy --config fly.session.toml --image-label latest"
   },
   "keywords": [],
   "author": "",

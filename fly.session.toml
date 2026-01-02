@@ -1,0 +1,8 @@
+app = 'tapcart-dev-session'
+primary_region = 'sjc'
+
+[build]
+  dockerfile = 'Dockerfile.session'
+
+# This app is just for hosting the image in the registry
+# No services needed - machines are created dynamically
