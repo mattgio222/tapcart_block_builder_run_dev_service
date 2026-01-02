@@ -1,26 +1,19 @@
 require('dotenv').config();
 const express = require('express');
-const { spawn, exec } = require('child_process');
-const { promisify } = require('util');
-const { createProxyMiddleware } = require('http-proxy-middleware');
 const { v4: uuidv4 } = require('uuid');
-const path = require('path');
-const fs = require('fs').promises;
-const net = require('net');
-
-const execPromise = promisify(exec);
 
 const app = express();
 const PORT = process.env.PORT || 3002;
-const BASE_URL = process.env.BASE_URL || 'http://localhost';
 
-// Session storage: sessionId -> { process, port, blockName, createdAt }
+// Fly.io API configuration
+const FLY_API_URL = process.env.FLY_API_URL || 'https://api.machines.dev/v1';
+const FLY_API_TOKEN = process.env.FLY_API_TOKEN;
+const FLY_ORG_SLUG = process.env.FLY_ORG_SLUG || 'personal';
+const FLY_REGION = process.env.FLY_REGION || 'sjc';
+const SESSION_IMAGE = process.env.SESSION_IMAGE || 'registry.fly.io/tapcart-dev-session:latest';
+
+// Session storage: sessionId -> { appName, machineId, url, createdAt }
 const sessions = new Map();
-
-// Port range for dev servers (internal ports, not exposed externally)
-const PORT_START = 6001;
-const PORT_END = 6020;
-const usedPorts = new Set();
 
 // Session timeout (30 minutes)
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
@@ -36,31 +29,88 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Get available port
-const getAvailablePort = async () => {
-  for (let port = PORT_START; port <= PORT_END; port++) {
-    if (!usedPorts.has(port)) {
-      // Check if port is actually available
-      const available = await new Promise((resolve) => {
-        const server = net.createServer();
-        server.listen(port, '0.0.0.0', () => {
-          server.close(() => resolve(true));
-        });
-        server.on('error', () => resolve(false));
-      });
+// Fly API helper
+const flyFetch = async (endpoint, options = {}) => {
+  const url = `${FLY_API_URL}${endpoint}`;
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${FLY_API_TOKEN}`,
+      'Content-Type': 'application/json',
+      ...options.headers,
+    },
+  });
 
-      if (available) {
-        usedPorts.add(port);
-        return port;
-      }
-    }
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
   }
-  return null;
+
+  if (!response.ok) {
+    throw new Error(`Fly API error (${response.status}): ${JSON.stringify(data)}`);
+  }
+
+  return data;
 };
 
-// Release port
-const releasePort = (port) => {
-  usedPorts.delete(port);
+// Create a Fly app for a session
+const createFlyApp = async (appName) => {
+  console.log(`[FLY] Creating app: ${appName}`);
+  return flyFetch('/apps', {
+    method: 'POST',
+    body: JSON.stringify({
+      app_name: appName,
+      org_slug: FLY_ORG_SLUG,
+    }),
+  });
+};
+
+// Delete a Fly app
+const deleteFlyApp = async (appName) => {
+  console.log(`[FLY] Deleting app: ${appName}`);
+  return flyFetch(`/apps/${appName}?force=true`, {
+    method: 'DELETE',
+  });
+};
+
+// Create a machine in a Fly app
+const createMachine = async (appName, config) => {
+  console.log(`[FLY] Creating machine in app: ${appName}`);
+  return flyFetch(`/apps/${appName}/machines`, {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+};
+
+// Wait for machine to be ready
+const waitForMachine = async (appName, machineId, maxWaitMs = 60000) => {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < maxWaitMs) {
+    try {
+      const machine = await flyFetch(`/apps/${appName}/machines/${machineId}`);
+      console.log(`[FLY] Machine ${machineId} state: ${machine.state}`);
+
+      if (machine.state === 'started') {
+        return machine;
+      }
+
+      if (machine.state === 'failed' || machine.state === 'destroyed') {
+        throw new Error(`Machine failed with state: ${machine.state}`);
+      }
+    } catch (err) {
+      if (!err.message.includes('404')) {
+        throw err;
+      }
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+
+  throw new Error('Timeout waiting for machine to start');
 };
 
 // Clean up a session
@@ -71,25 +121,11 @@ const cleanupSession = async (sessionId) => {
   console.log(`[CLEANUP] Cleaning up session ${sessionId}`);
 
   try {
-    // Kill the child process
-    if (session.process && !session.process.killed) {
-      session.process.kill('SIGTERM');
-      // Force kill after 5 seconds if still running
-      setTimeout(() => {
-        if (session.process && !session.process.killed) {
-          session.process.kill('SIGKILL');
-        }
-      }, 5000);
-    }
-
-    // Clean up session directory
-    const sessionDir = `/tmp/sessions/${sessionId}`;
-    await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+    await deleteFlyApp(session.appName);
   } catch (err) {
-    console.error(`[CLEANUP] Error:`, err.message);
+    console.error(`[CLEANUP] Error deleting app:`, err.message);
   }
 
-  releasePort(session.port);
   sessions.delete(sessionId);
   console.log(`[CLEANUP] Session ${sessionId} cleaned up`);
 };
@@ -131,168 +167,105 @@ app.post('/start-dev', authenticateApiKey, async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  const sessionId = uuidv4().slice(0, 8);
-  const port = await getAvailablePort();
-
-  if (!port) {
-    return res.status(503).json({ error: 'No available ports' });
+  // Check Fly API token
+  if (!FLY_API_TOKEN) {
+    return res.status(500).json({ error: 'Fly API token not configured' });
   }
 
-  console.log(`[START] Creating session ${sessionId} on port ${port}`);
+  const sessionId = uuidv4().slice(0, 8);
+  const appName = `tapcart-dev-${sessionId}`;
+
+  console.log(`[START] Creating session ${sessionId}`);
 
   try {
-    // Create temp directory for this session
-    const sessionDir = `/tmp/sessions/${sessionId}`;
-    await fs.mkdir(sessionDir, { recursive: true });
+    // Step 1: Create the Fly app
+    await createFlyApp(appName);
+    console.log(`[START] App ${appName} created`);
 
-    // Write tapcart.config.json first (required before block create)
-    await fs.writeFile(`${sessionDir}/tapcart.config.json`, JSON.stringify({
-      appId,
-      dependencies: {}
-    }, null, 2));
+    // Step 2: Base64 encode the code files
+    const codeJsxB64 = Buffer.from(codeJsx).toString('base64');
+    const manifestJsonB64 = manifestJson
+      ? Buffer.from(typeof manifestJson === 'string' ? manifestJson : JSON.stringify(manifestJson)).toString('base64')
+      : '';
 
-    // Write package.json
-    await fs.writeFile(`${sessionDir}/package.json`, JSON.stringify({
-      name: "tapcart-dev",
-      version: "1.0.0",
-      private: true
-    }, null, 2));
-
-    // Create the block using tapcart CLI (this creates config.json and updates tapcart.config.json)
-    console.log(`[${sessionId}] Creating block "${appStudioBlockName}"...`);
-    await execPromise(`tapcart block create "${appStudioBlockName}"`, {
-      cwd: sessionDir,
-      timeout: 60000,
-      env: { ...process.env, TAPCART_API_KEY: tapcartCliApiKey }
-    });
-    console.log(`[${sessionId}] Block created successfully`);
-
-    // Now overwrite code.jsx with the provided code
-    const blockDir = `${sessionDir}/blocks/${appStudioBlockName}`;
-    await fs.writeFile(`${blockDir}/code.jsx`, codeJsx);
-
-    // Write manifest.json if provided
-    if (manifestJson) {
-      const manifest = typeof manifestJson === 'string' ? manifestJson : JSON.stringify(manifestJson, null, 2);
-      await fs.writeFile(`${blockDir}/manifest.json`, manifest);
-    }
-
-    // Spawn tapcart dev server as child process
-    const childProcess = spawn('tapcart', ['block', 'dev', '-b', appStudioBlockName, '-p', port.toString()], {
-      cwd: sessionDir,
-      env: {
-        ...process.env,
-        TAPCART_API_KEY: tapcartCliApiKey,
-        NODE_ENV: 'development'
+    // Step 3: Create the machine with the session image
+    const machineConfig = {
+      name: `dev-${sessionId}`,
+      region: FLY_REGION,
+      config: {
+        image: SESSION_IMAGE,
+        env: {
+          APP_ID: appId,
+          BLOCK_NAME: appStudioBlockName,
+          TAPCART_API_KEY: tapcartCliApiKey,
+          CODE_JSX_B64: codeJsxB64,
+          MANIFEST_JSON_B64: manifestJsonB64,
+        },
+        services: [
+          {
+            protocol: 'tcp',
+            internal_port: 5000,
+            ports: [
+              {
+                port: 80,
+                handlers: ['http'],
+              },
+              {
+                port: 443,
+                handlers: ['tls', 'http'],
+              },
+            ],
+          },
+        ],
+        guest: {
+          cpu_kind: 'shared',
+          cpus: 1,
+          memory_mb: 512,
+        },
+        auto_destroy: true,
       },
-      stdio: ['ignore', 'pipe', 'pipe']
-    });
+    };
 
-    let serverStarted = false;
-    let startError = null;
+    const machine = await createMachine(appName, machineConfig);
+    console.log(`[START] Machine ${machine.id} created`);
 
-    // Capture output for debugging
-    childProcess.stdout.on('data', (data) => {
-      const output = data.toString();
-      console.log(`[${sessionId}] stdout: ${output}`);
-      // Check if server started successfully
-      if (output.includes('Dev server running') || output.includes('listening') || output.includes('Started')) {
-        serverStarted = true;
-      }
-    });
+    // Step 4: Wait for machine to be ready
+    await waitForMachine(appName, machine.id);
+    console.log(`[START] Machine ${machine.id} is ready`);
 
-    childProcess.stderr.on('data', (data) => {
-      const output = data.toString();
-      console.error(`[${sessionId}] stderr: ${output}`);
-      if (output.includes('Error') || output.includes('error')) {
-        startError = output;
-      }
-    });
-
-    childProcess.on('error', (err) => {
-      console.error(`[${sessionId}] Process error:`, err);
-      startError = err.message;
-    });
-
-    childProcess.on('exit', (code, signal) => {
-      console.log(`[${sessionId}] Process exited with code ${code}, signal ${signal}`);
-      // Clean up if process exits unexpectedly
-      if (sessions.has(sessionId)) {
-        cleanupSession(sessionId);
-      }
-    });
-
-    // Store session immediately
+    // Step 5: Store session info
+    const url = `https://${appName}.fly.dev`;
     sessions.set(sessionId, {
-      process: childProcess,
-      port,
+      appName,
+      machineId: machine.id,
+      url,
       blockName: appStudioBlockName,
       configurationId,
-      createdAt: Date.now()
+      createdAt: Date.now(),
     });
 
-    // Wait for server to start (poll for a few seconds)
-    const startTime = Date.now();
-    const timeout = 15000; // 15 seconds
+    // Give the dev server a moment to start
+    await new Promise(resolve => setTimeout(resolve, 3000));
 
-    while (!serverStarted && !startError && Date.now() - startTime < timeout) {
-      // Check if process is still running
-      if (childProcess.killed || childProcess.exitCode !== null) {
-        startError = 'Process exited unexpectedly';
-        break;
-      }
-
-      // Try to connect to the port
-      const isReady = await new Promise((resolve) => {
-        const socket = new net.Socket();
-        socket.setTimeout(1000);
-        socket.on('connect', () => {
-          socket.destroy();
-          resolve(true);
-        });
-        socket.on('error', () => {
-          socket.destroy();
-          resolve(false);
-        });
-        socket.on('timeout', () => {
-          socket.destroy();
-          resolve(false);
-        });
-        socket.connect(port, '127.0.0.1');
-      });
-
-      if (isReady) {
-        serverStarted = true;
-        break;
-      }
-
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-
-    if (!serverStarted) {
-      await cleanupSession(sessionId);
-      return res.status(500).json({
-        error: 'Dev server failed to start',
-        details: startError || 'Timeout waiting for server'
-      });
-    }
-
-    // URL for accessing this session via proxy
-    const url = `${BASE_URL}/dev/${sessionId}`;
-    console.log(`[START] Session ${sessionId} started at ${url} (internal port ${port})`);
+    console.log(`[START] Session ${sessionId} started at ${url}`);
 
     res.json({
       success: true,
       sessionId,
-      port,
       url,
-      message: 'Dev server started'
+      message: 'Dev server started',
     });
 
   } catch (error) {
     console.error(`[START] Error:`, error);
-    releasePort(port);
-    sessions.delete(sessionId);
+
+    // Try to clean up the app if it was created
+    try {
+      await deleteFlyApp(appName);
+    } catch (cleanupErr) {
+      console.error(`[START] Cleanup error:`, cleanupErr.message);
+    }
+
     res.status(500).json({ error: 'Failed to start dev server', details: error.message });
   }
 });
@@ -315,123 +288,13 @@ app.get('/sessions', authenticateApiKey, (req, res) => {
   for (const [id, session] of sessions.entries()) {
     sessionList.push({
       sessionId: id,
-      port: session.port,
+      appName: session.appName,
+      url: session.url,
       blockName: session.blockName,
       createdAt: session.createdAt,
-      url: `${BASE_URL}/dev/${id}`
     });
   }
   res.json({ sessions: sessionList });
-});
-
-// Helper to create proxy for a session
-const createSessionProxy = (sessionId, session) => {
-  return createProxyMiddleware({
-    target: `http://127.0.0.1:${session.port}`,
-    changeOrigin: true,
-    pathRewrite: (path) => {
-      // Remove /dev/sessionId prefix if present
-      if (path.startsWith(`/dev/${sessionId}`)) {
-        return path.replace(`/dev/${sessionId}`, '') || '/';
-      }
-      // Remove just /dev/ prefix for cookie-based routing
-      if (path.startsWith('/dev/')) {
-        return path.replace('/dev/', '/') || '/';
-      }
-      return path;
-    },
-    ws: true,
-    onProxyRes: (proxyRes, req, res) => {
-      // Add CSP header to upgrade HTTP to HTTPS (fixes mixed content issues)
-      proxyRes.headers['content-security-policy'] = 'upgrade-insecure-requests';
-    },
-    onError: (err, req, res) => {
-      console.error(`[PROXY] Error for session ${sessionId}:`, err.message);
-      if (res.writeHead) {
-        res.status(502).json({ error: 'Dev server unavailable' });
-      }
-    }
-  });
-};
-
-// Proxy requests to dev sessions: /dev/:sessionId/*
-app.use('/dev/:sessionId', (req, res, next) => {
-  const { sessionId } = req.params;
-  const session = sessions.get(sessionId);
-
-  if (!session) {
-    // Session ID not found - might be an asset path, try cookie-based routing
-    return next();
-  }
-
-  // Set cookie to remember this session for subsequent asset requests
-  res.cookie('dev_session', sessionId, {
-    httpOnly: true,
-    sameSite: 'lax',
-    maxAge: 30 * 60 * 1000 // 30 minutes
-  });
-
-  const proxy = createSessionProxy(sessionId, session);
-  return proxy(req, res, next);
-});
-
-// Fallback: Handle /dev/* requests without valid session ID (asset requests)
-// Uses cookie to determine which session to route to
-app.use('/dev', (req, res, next) => {
-  // Try to get session from cookie
-  const cookieHeader = req.headers.cookie || '';
-  const sessionMatch = cookieHeader.match(/dev_session=([^;]+)/);
-  const sessionId = sessionMatch ? sessionMatch[1] : null;
-
-  if (!sessionId) {
-    return res.status(404).json({ error: 'No active session' });
-  }
-
-  const session = sessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session expired' });
-  }
-
-  console.log(`[PROXY] Routing ${req.path} to session ${sessionId} via cookie`);
-  const proxy = createSessionProxy(sessionId, session);
-  return proxy(req, res, next);
-});
-
-// Root-level Tapcart API endpoints - route via cookie
-// These are requested by the Tapcart dev server's frontend
-const tapcartApiEndpoints = ['/modes', '/theme', '/fonts', '/dependencies', '/components', '/currency', '/scope', '/settings', '/collections'];
-
-app.use(tapcartApiEndpoints, (req, res, next) => {
-  // Try to get session from cookie
-  const cookieHeader = req.headers.cookie || '';
-  const sessionMatch = cookieHeader.match(/dev_session=([^;]+)/);
-  const sessionId = sessionMatch ? sessionMatch[1] : null;
-
-  if (!sessionId) {
-    return res.status(404).json({ error: 'No active session for API request' });
-  }
-
-  const session = sessions.get(sessionId);
-  if (!session) {
-    return res.status(404).json({ error: 'Session expired' });
-  }
-
-  console.log(`[PROXY] Routing API ${req.path} to session ${sessionId} via cookie`);
-
-  // Create a simple proxy for root-level requests
-  const proxy = createProxyMiddleware({
-    target: `http://127.0.0.1:${session.port}`,
-    changeOrigin: true,
-    onProxyRes: (proxyRes) => {
-      proxyRes.headers['content-security-policy'] = 'upgrade-insecure-requests';
-    },
-    onError: (err) => {
-      console.error(`[PROXY] API error for session ${sessionId}:`, err.message);
-      res.status(502).json({ error: 'Dev server unavailable' });
-    }
-  });
-
-  return proxy(req, res, next);
 });
 
 // Start server
@@ -439,7 +302,9 @@ app.listen(PORT, () => {
   console.log('========================================');
   console.log('Block Builder Run Dev Service');
   console.log(`Port: ${PORT}`);
-  console.log(`Base URL: ${BASE_URL}`);
+  console.log(`Fly Org: ${FLY_ORG_SLUG}`);
+  console.log(`Fly Region: ${FLY_REGION}`);
+  console.log(`Session Image: ${SESSION_IMAGE}`);
   console.log(`Timestamp: ${new Date().toISOString()}`);
   console.log('========================================');
 });

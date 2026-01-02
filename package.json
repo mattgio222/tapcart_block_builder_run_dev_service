@@ -1,11 +1,13 @@
 {
   "name": "block-builder-run-dev-service",
-  "version": "1.0.0",
-  "description": "Run Dev service for Tapcart blocks",
+  "version": "2.0.0",
+  "description": "Run Dev service using Fly Machines API",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "nodemon src/index.js"
+    "dev": "nodemon src/index.js",
+    "build-session-image": "docker build -t tapcart-dev-session -f Dockerfile.session .",
+    "push-session-image": "fly auth docker && docker tag tapcart-dev-session registry.fly.io/tapcart-dev-session:latest && docker push registry.fly.io/tapcart-dev-session:latest"
   },
   "keywords": [],
   "author": "",
@@ -17,7 +19,6 @@
   "dependencies": {
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "http-proxy-middleware": "^2.0.6",
     "uuid": "^9.0.0"
   },
   "devDependencies": {
