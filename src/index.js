@@ -103,6 +103,7 @@ const allocateIPs = async (appName) => {
   });
 
   const ipv4Result = await ipv4Response.json();
+  console.log(`[FLY] IPv4 allocation response:`, JSON.stringify(ipv4Result));
   if (ipv4Result.errors) {
     console.error(`[FLY] IPv4 allocation error:`, ipv4Result.errors);
   } else {
