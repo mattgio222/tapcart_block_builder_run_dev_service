@@ -397,6 +397,43 @@ app.use('/dev', (req, res, next) => {
   return proxy(req, res, next);
 });
 
+// Root-level Tapcart API endpoints - route via cookie
+// These are requested by the Tapcart dev server's frontend
+const tapcartApiEndpoints = ['/modes', '/theme', '/fonts', '/dependencies', '/components', '/currency', '/scope', '/settings', '/collections'];
+
+app.use(tapcartApiEndpoints, (req, res, next) => {
+  // Try to get session from cookie
+  const cookieHeader = req.headers.cookie || '';
+  const sessionMatch = cookieHeader.match(/dev_session=([^;]+)/);
+  const sessionId = sessionMatch ? sessionMatch[1] : null;
+
+  if (!sessionId) {
+    return res.status(404).json({ error: 'No active session for API request' });
+  }
+
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session expired' });
+  }
+
+  console.log(`[PROXY] Routing API ${req.path} to session ${sessionId} via cookie`);
+
+  // Create a simple proxy for root-level requests
+  const proxy = createProxyMiddleware({
+    target: `http://127.0.0.1:${session.port}`,
+    changeOrigin: true,
+    onProxyRes: (proxyRes) => {
+      proxyRes.headers['content-security-policy'] = 'upgrade-insecure-requests';
+    },
+    onError: (err) => {
+      console.error(`[PROXY] API error for session ${sessionId}:`, err.message);
+      res.status(502).json({ error: 'Dev server unavailable' });
+    }
+  });
+
+  return proxy(req, res, next);
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log('========================================');
