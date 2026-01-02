@@ -324,29 +324,72 @@ app.get('/sessions', authenticateApiKey, (req, res) => {
   res.json({ sessions: sessionList });
 });
 
+// Helper to create proxy for a session
+const createSessionProxy = (sessionId, session) => {
+  return createProxyMiddleware({
+    target: `http://127.0.0.1:${session.port}`,
+    changeOrigin: true,
+    pathRewrite: (path) => {
+      // Remove /dev/sessionId prefix if present
+      if (path.startsWith(`/dev/${sessionId}`)) {
+        return path.replace(`/dev/${sessionId}`, '') || '/';
+      }
+      // Remove just /dev/ prefix for cookie-based routing
+      if (path.startsWith('/dev/')) {
+        return path.replace('/dev/', '/') || '/';
+      }
+      return path;
+    },
+    ws: true,
+    onError: (err, req, res) => {
+      console.error(`[PROXY] Error for session ${sessionId}:`, err.message);
+      if (res.writeHead) {
+        res.status(502).json({ error: 'Dev server unavailable' });
+      }
+    }
+  });
+};
+
 // Proxy requests to dev sessions: /dev/:sessionId/*
 app.use('/dev/:sessionId', (req, res, next) => {
   const { sessionId } = req.params;
   const session = sessions.get(sessionId);
 
   if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
+    // Session ID not found - might be an asset path, try cookie-based routing
+    return next();
   }
 
-  // Create proxy middleware for this request
-  const proxy = createProxyMiddleware({
-    target: `http://127.0.0.1:${session.port}`,
-    changeOrigin: true,
-    pathRewrite: {
-      [`^/dev/${sessionId}`]: ''
-    },
-    ws: true,
-    onError: (err, req, res) => {
-      console.error(`[PROXY] Error for session ${sessionId}:`, err.message);
-      res.status(502).json({ error: 'Dev server unavailable' });
-    }
+  // Set cookie to remember this session for subsequent asset requests
+  res.cookie('dev_session', sessionId, {
+    httpOnly: true,
+    sameSite: 'lax',
+    maxAge: 30 * 60 * 1000 // 30 minutes
   });
 
+  const proxy = createSessionProxy(sessionId, session);
+  return proxy(req, res, next);
+});
+
+// Fallback: Handle /dev/* requests without valid session ID (asset requests)
+// Uses cookie to determine which session to route to
+app.use('/dev', (req, res, next) => {
+  // Try to get session from cookie
+  const cookieHeader = req.headers.cookie || '';
+  const sessionMatch = cookieHeader.match(/dev_session=([^;]+)/);
+  const sessionId = sessionMatch ? sessionMatch[1] : null;
+
+  if (!sessionId) {
+    return res.status(404).json({ error: 'No active session' });
+  }
+
+  const session = sessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session expired' });
+  }
+
+  console.log(`[PROXY] Routing ${req.path} to session ${sessionId} via cookie`);
+  const proxy = createSessionProxy(sessionId, session);
   return proxy(req, res, next);
 });
 
